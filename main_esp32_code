@@ -3,45 +3,85 @@
 #include <HX711.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <math.h>
 
 // =========================
-// WIFI / MQTT AYARLARI
+// WIFI / MQTT
 // =========================
-const char* ssid = "Wifi_adi";
-const char* password = "Wifi_sifre";
+const char* ssid = "PAPELON";
+const char* password = "papelon2020";
 
 const char* mqtt_server = "broker.hivemq.com";
 const int mqtt_port = 1883;
 
-const char* topic_data = "ddm/avadanlik/A1";
+const char* topic_data = "ddm/avadanlik/A1/data";
 const char* topic_cmd  = "ddm/avadanlik/A1/cmd";
 
 // =========================
-// HX711 PINLERI
+// PINLER
 // =========================
 #define HX_DT 23
 #define HX_SCK 22
+#define IR_PIN 14
 
+// =========================
+// NESNELER
+// =========================
 HX711 scale;
 WiFiClient espClient;
 PubSubClient client(espClient);
 Preferences prefs;
 
 // =========================
-// SISTEM DEGISKENLERI
+// AYARLAR
 // =========================
-float calibration_factor = -7050.0;   // Sonradan bulunan değerle değişecek
+float calibration_factor = -7050.0;   // Kalibrasyondan sonra güncellenecek
 float unit_weight = 0.0;              // Tek ürün ağırlığı
-float current_weight = 0.0;           // Anlık ağırlık
-int estimated_count = 0;              // Tahmini ürün sayısı
-long total_count = 0;                 // Toplam sayaç
-String current_mode = "idle";         // idle / counting / teach
+
+float zero_threshold = 2.0;           // küçük değerleri sıfır kabul et
+float stable_delta = 1.5;             // stabil sayılma farkı
+int stable_required_count = 5;        // kaç döngü stabil kalmalı
+
+unsigned long publishInterval = 1000;
+
+// IR aktif seviyesi
+bool IR_ACTIVE_STATE = LOW;
+
+// IR olay yönetimi
+unsigned long irDebounceMs = 300;
+unsigned long irEventTimeoutMs = 3000;
+
+// EMA filtre
+const float alpha = 0.2;
+
+// =========================
+// CALISMA DEGISKENLERI
+// =========================
+float current_weight = 0.0;
+float filtered_weight = 0.0;
+float last_filtered_weight = 0.0;
+float stable_weight = 0.0;
+
+int estimated_count = 0;
+int last_stable_count = 0;
+long total_count = 0;
+
+bool weight_is_stable = false;
+int stable_counter = 0;
+
+String current_mode = "counting"; // idle / counting / teach
 
 unsigned long lastPublishTime = 0;
-const unsigned long publishInterval = 1000;
+
+// IR durum değişkenleri
+bool ir_current_state = false;
+bool ir_last_state = false;
+bool ir_event_active = false;
+unsigned long lastIrChangeTime = 0;
+unsigned long irEventStartTime = 0;
 
 // =========================
-// YARDIMCI FONKSIYONLAR
+// WIFI / MQTT
 // =========================
 void setupWiFi() {
   Serial.println();
@@ -72,32 +112,29 @@ void reconnectMQTT() {
     if (client.connect(clientId.c_str())) {
       Serial.println("baglandi");
       client.subscribe(topic_cmd);
-      Serial.print("Subscribe olundu: ");
+      Serial.print("Subscribe: ");
       Serial.println(topic_cmd);
     } else {
-      Serial.print("basarisiz, rc=");
+      Serial.print("hata rc=");
       Serial.print(client.state());
-      Serial.println(" tekrar denenecek");
+      Serial.println(" yeniden denenecek");
       delay(2000);
     }
   }
 }
 
-float readStableWeight(int samples = 20) {
-  if (!scale.is_ready()) {
-    return 0.0;
-  }
-  return scale.get_units(samples);
-}
-
+// =========================
+// KALICI HAFIZA
+// =========================
 void saveConfig() {
   prefs.begin("loadcell", false);
   prefs.putFloat("cal_factor", calibration_factor);
   prefs.putFloat("unit_weight", unit_weight);
   prefs.putLong("total_count", total_count);
+  prefs.putString("mode", current_mode);
   prefs.end();
 
-  Serial.println("Ayarlar kaydedildi.");
+  Serial.println("Config kaydedildi.");
 }
 
 void loadConfig() {
@@ -105,98 +142,290 @@ void loadConfig() {
   calibration_factor = prefs.getFloat("cal_factor", -7050.0);
   unit_weight = prefs.getFloat("unit_weight", 0.0);
   total_count = prefs.getLong("total_count", 0);
+  current_mode = prefs.getString("mode", "counting");
   prefs.end();
 
-  Serial.println("Ayarlar yuklendi:");
+  Serial.println("Config yuklendi:");
   Serial.print("calibration_factor = ");
   Serial.println(calibration_factor);
   Serial.print("unit_weight = ");
   Serial.println(unit_weight);
   Serial.print("total_count = ");
   Serial.println(total_count);
+  Serial.print("mode = ");
+  Serial.println(current_mode);
+}
+
+// =========================
+// JSON YAYIN FONKSIYONLARI
+// =========================
+void publishJson(const JsonDocument& doc) {
+  char buffer[512];
+  serializeJson(doc, buffer);
+  client.publish(topic_data, buffer);
+  Serial.print("Yayin -> ");
+  Serial.println(buffer);
 }
 
 void publishStatus(const char* eventName = "status") {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
 
   doc["event"] = eventName;
-  doc["weight"] = current_weight;
+  doc["mode"] = current_mode;
+  doc["weight_raw"] = current_weight;
+  doc["weight_filtered"] = filtered_weight;
+  doc["weight_stable"] = stable_weight;
+  doc["stable"] = weight_is_stable;
   doc["unit_weight"] = unit_weight;
   doc["estimated_count"] = estimated_count;
+  doc["last_stable_count"] = last_stable_count;
   doc["total_count"] = total_count;
-  doc["mode"] = current_mode;
+  doc["ir"] = ir_current_state;
+  doc["ir_event_active"] = ir_event_active;
   doc["wifi"] = (WiFi.status() == WL_CONNECTED) ? "connected" : "disconnected";
   doc["mqtt"] = client.connected() ? "connected" : "disconnected";
 
-  char buffer[256];
-  serializeJson(doc, buffer);
+  publishJson(doc);
+}
 
-  client.publish(topic_data, buffer);
-  Serial.print("Yayinlandi -> ");
-  Serial.println(buffer);
+void publishEvent(const char* eventName) {
+  StaticJsonDocument<512> doc;
+
+  doc["event"] = eventName;
+  doc["mode"] = current_mode;
+  doc["weight_filtered"] = filtered_weight;
+  doc["weight_stable"] = stable_weight;
+  doc["unit_weight"] = unit_weight;
+  doc["estimated_count"] = estimated_count;
+  doc["last_stable_count"] = last_stable_count;
+  doc["total_count"] = total_count;
+  doc["ir"] = ir_current_state;
+  doc["ir_event_active"] = ir_event_active;
+
+  publishJson(doc);
+}
+
+// =========================
+// LOADCELL
+// =========================
+float readWeightRaw(int samples = 20) {
+  if (!scale.is_ready()) {
+    return 0.0;
+  }
+
+  float w = scale.get_units(samples);
+
+  if (fabs(w) < zero_threshold) {
+    w = 0.0;
+  }
+
+  return w;
 }
 
 void doTare() {
   Serial.println("Tare yapiliyor...");
-  current_mode = "idle";
-
   scale.set_scale(calibration_factor);
-  delay(300);
+  delay(200);
   scale.tare();
-  delay(300);
+  delay(500);
 
-  current_weight = readStableWeight(20);
+  current_weight = 0.0;
+  filtered_weight = 0.0;
+  last_filtered_weight = 0.0;
+  stable_weight = 0.0;
   estimated_count = 0;
+  last_stable_count = 0;
+  stable_counter = 0;
+  weight_is_stable = false;
 
-  Serial.println("Tare tamamlandi.");
-  publishStatus("tare_done");
+  Serial.println("Tare tamam.");
 }
 
-void doTeach(int sampleCount) {
-  if (sampleCount <= 0) {
-    Serial.println("Gecersiz sampleCount");
-    publishStatus("teach_failed");
+void updateWeight() {
+  current_weight = readWeightRaw(10);
+
+  filtered_weight = (alpha * current_weight) + ((1.0 - alpha) * filtered_weight);
+
+  if (fabs(filtered_weight - last_filtered_weight) <= stable_delta) {
+    stable_counter++;
+  } else {
+    stable_counter = 0;
+    weight_is_stable = false;
+  }
+
+  if (stable_counter >= stable_required_count) {
+    weight_is_stable = true;
+    stable_weight = filtered_weight;
+  }
+
+  last_filtered_weight = filtered_weight;
+}
+
+int calculateEstimatedCount(float weight) {
+  if (unit_weight <= 0.001) {
+    return 0;
+  }
+
+  int c = (int)round(weight / unit_weight);
+  if (c < 0) c = 0;
+  return c;
+}
+
+// =========================
+// IR SENSOR
+// =========================
+bool readIR() {
+  int val = digitalRead(IR_PIN);
+  return (val == IR_ACTIVE_STATE);
+}
+
+void updateIRState() {
+  bool reading = readIR();
+
+  if (reading != ir_last_state) {
+    lastIrChangeTime = millis();
+  }
+
+  if ((millis() - lastIrChangeTime) > irDebounceMs) {
+    if (reading != ir_current_state) {
+      ir_current_state = reading;
+
+      if (ir_current_state) {
+        ir_event_active = true;
+        irEventStartTime = millis();
+        publishEvent("ir_triggered");
+        Serial.println("IR tetiklendi.");
+      } else {
+        publishEvent("ir_cleared");
+        Serial.println("IR normale dondu.");
+      }
+    }
+  }
+
+  ir_last_state = reading;
+
+  // Event çok uzun sürerse kapat
+  if (ir_event_active && (millis() - irEventStartTime > irEventTimeoutMs)) {
+    ir_event_active = false;
+    publishEvent("ir_event_timeout");
+    Serial.println("IR event timeout.");
+  }
+}
+
+// =========================
+// SAYIM MANTIGI
+// =========================
+void processCountingLogic() {
+  estimated_count = calculateEstimatedCount(filtered_weight);
+
+  if (current_mode != "counting") {
     return;
   }
 
-  Serial.print("Teach basladi. Ornek adet: ");
+  if (!ir_event_active) {
+    return;
+  }
+
+  if (weight_is_stable) {
+    int stableCountNow = calculateEstimatedCount(stable_weight);
+
+    if (stableCountNow != last_stable_count) {
+      int diff = stableCountNow - last_stable_count;
+
+      // Sadece artışları toplam sayaca ekle
+      if (diff > 0) {
+        total_count += diff;
+        saveConfig();
+        publishEvent("count_increased");
+      } else {
+        publishEvent("count_changed");
+      }
+
+      last_stable_count = stableCountNow;
+
+      // Bu IR olayı için sayımı tamamladık, event'i kapat
+      ir_event_active = false;
+      publishEvent("ir_event_processed");
+    }
+  }
+}
+
+// =========================
+// KOMUTLAR
+// =========================
+void handleTeach(int sampleCount) {
+  if (sampleCount <= 0) {
+    publishEvent("teach_failed");
+    return;
+  }
+
+  Serial.print("Teach basladi. sample_count = ");
   Serial.println(sampleCount);
 
   current_mode = "teach";
-  delay(1000);
+  delay(1500);
 
-  float measuredWeight = readStableWeight(30);
+  float measured = readWeightRaw(30);
 
-  if (sampleCount > 0) {
-    unit_weight = measuredWeight / sampleCount;
+  if (fabs(measured) < zero_threshold) {
+    Serial.println("Teach basarisiz: olculen agirlik cok dusuk.");
+    current_mode = "counting";
+    publishEvent("teach_failed");
+    return;
   }
 
-  Serial.print("Toplam olculen agirlik: ");
-  Serial.println(measuredWeight);
-  Serial.print("Hesaplanan unit_weight: ");
-  Serial.println(unit_weight);
+  unit_weight = measured / sampleCount;
+
+  if (unit_weight < 0) {
+    unit_weight = fabs(unit_weight);
+  }
 
   saveConfig();
-  current_mode = "idle";
-  publishStatus("teach_done");
+
+  Serial.print("Teach tamam. Toplam agirlik = ");
+  Serial.println(measured);
+  Serial.print("unit_weight = ");
+  Serial.println(unit_weight);
+
+  current_mode = "counting";
+  publishEvent("teach_done");
 }
 
 void setUnitWeight(float value) {
+  if (value <= 0.0) {
+    publishEvent("set_unit_weight_failed");
+    return;
+  }
+
   unit_weight = value;
-  Serial.print("Yeni unit_weight ayarlandi: ");
+  saveConfig();
+
+  Serial.print("unit_weight ayarlandi: ");
   Serial.println(unit_weight);
 
-  saveConfig();
-  publishStatus("unit_weight_set");
+  publishEvent("unit_weight_set");
 }
 
-void resetCount() {
+void resetTotal() {
   total_count = 0;
-  estimated_count = 0;
+  last_stable_count = 0;
+  saveConfig();
 
   Serial.println("Toplam sayac sifirlandi.");
-  saveConfig();
-  publishStatus("count_reset");
+  publishEvent("total_reset");
+}
+
+void setMode(const char* modeValue) {
+  if (strcmp(modeValue, "idle") == 0 || strcmp(modeValue, "counting") == 0 || strcmp(modeValue, "teach") == 0) {
+    current_mode = String(modeValue);
+    saveConfig();
+
+    Serial.print("Mode degisti: ");
+    Serial.println(current_mode);
+    publishEvent("mode_changed");
+  } else {
+    publishEvent("mode_invalid");
+  }
 }
 
 void handleCommand(char* payload) {
@@ -206,61 +435,62 @@ void handleCommand(char* payload) {
   if (error) {
     Serial.print("JSON parse hatasi: ");
     Serial.println(error.c_str());
-    publishStatus("cmd_parse_error");
+    publishEvent("cmd_parse_error");
     return;
   }
 
   const char* command = doc["command"];
-
   if (!command) {
-    Serial.println("Komut alani yok.");
-    publishStatus("cmd_missing");
+    publishEvent("cmd_missing");
     return;
   }
 
-  Serial.print("Gelen komut: ");
+  Serial.print("Komut geldi: ");
   Serial.println(command);
 
   if (strcmp(command, "tare") == 0) {
     doTare();
+    publishEvent("tare_done");
   }
   else if (strcmp(command, "teach") == 0) {
     int sampleCount = doc["sample_count"] | 1;
-    doTeach(sampleCount);
+    handleTeach(sampleCount);
   }
   else if (strcmp(command, "set_unit_weight") == 0) {
     float value = doc["value"] | 0.0;
     setUnitWeight(value);
   }
-  else if (strcmp(command, "reset_count") == 0) {
-    resetCount();
+  else if (strcmp(command, "reset_total") == 0) {
+    resetTotal();
+  }
+  else if (strcmp(command, "set_mode") == 0) {
+    const char* modeValue = doc["mode"] | "counting";
+    setMode(modeValue);
   }
   else if (strcmp(command, "ping") == 0) {
-    publishStatus("pong");
+    publishEvent("pong");
   }
   else {
-    Serial.println("Bilinmeyen komut.");
-    publishStatus("unknown_command");
+    publishEvent("unknown_command");
   }
 }
 
 void mqttCallback(char* topic, byte* message, unsigned int length) {
-  Serial.print("Mesaj geldi [");
-  Serial.print(topic);
-  Serial.print("] ");
-
   char payload[256];
+
   if (length >= sizeof(payload)) {
     length = sizeof(payload) - 1;
   }
 
   for (unsigned int i = 0; i < length; i++) {
     payload[i] = (char)message[i];
-    Serial.print((char)message[i]);
   }
   payload[length] = '\0';
 
-  Serial.println();
+  Serial.print("Mesaj [");
+  Serial.print(topic);
+  Serial.print("] -> ");
+  Serial.println(payload);
 
   handleCommand(payload);
 }
@@ -274,12 +504,14 @@ void setup() {
 
   Serial.println("Sistem basliyor...");
 
+  pinMode(IR_PIN, INPUT);
+
   loadConfig();
 
   scale.begin(HX_DT, HX_SCK);
 
   if (!scale.is_ready()) {
-    Serial.println("HX711 bulunamadi! Baglantiyi kontrol et.");
+    Serial.println("HX711 bulunamadi. Baglantiyi kontrol et.");
     while (1) {
       delay(1000);
     }
@@ -304,19 +536,10 @@ void loop() {
   }
   client.loop();
 
-  current_weight = readStableWeight(20);
+  updateIRState();
+  updateWeight();
+  processCountingLogic();
 
-  // unit_weight tanimliysa tahmini adet hesapla
-  if (unit_weight > 0.001) {
-    estimated_count = round(current_weight / unit_weight);
-    if (estimated_count < 0) {
-      estimated_count = 0;
-    }
-  } else {
-    estimated_count = 0;
-  }
-
-  // Periyodik durum yayini
   if (millis() - lastPublishTime >= publishInterval) {
     lastPublishTime = millis();
     publishStatus("status");
