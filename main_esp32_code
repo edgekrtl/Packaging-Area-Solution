@@ -1,0 +1,326 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <HX711.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+
+// =========================
+// WIFI / MQTT AYARLARI
+// =========================
+const char* ssid = "Wifi_adi";
+const char* password = "Wifi_sifre";
+
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+
+const char* topic_data = "ddm/avadanlik/A1";
+const char* topic_cmd  = "ddm/avadanlik/A1/cmd";
+
+// =========================
+// HX711 PINLERI
+// =========================
+#define HX_DT 23
+#define HX_SCK 22
+
+HX711 scale;
+WiFiClient espClient;
+PubSubClient client(espClient);
+Preferences prefs;
+
+// =========================
+// SISTEM DEGISKENLERI
+// =========================
+float calibration_factor = -7050.0;   // Sonradan bulunan değerle değişecek
+float unit_weight = 0.0;              // Tek ürün ağırlığı
+float current_weight = 0.0;           // Anlık ağırlık
+int estimated_count = 0;              // Tahmini ürün sayısı
+long total_count = 0;                 // Toplam sayaç
+String current_mode = "idle";         // idle / counting / teach
+
+unsigned long lastPublishTime = 0;
+const unsigned long publishInterval = 1000;
+
+// =========================
+// YARDIMCI FONKSIYONLAR
+// =========================
+void setupWiFi() {
+  Serial.println();
+  Serial.print("WiFi baglaniyor: ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi baglandi");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("MQTT baglaniyor... ");
+
+    String clientId = "ESP32-";
+    clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("baglandi");
+      client.subscribe(topic_cmd);
+      Serial.print("Subscribe olundu: ");
+      Serial.println(topic_cmd);
+    } else {
+      Serial.print("basarisiz, rc=");
+      Serial.print(client.state());
+      Serial.println(" tekrar denenecek");
+      delay(2000);
+    }
+  }
+}
+
+float readStableWeight(int samples = 20) {
+  if (!scale.is_ready()) {
+    return 0.0;
+  }
+  return scale.get_units(samples);
+}
+
+void saveConfig() {
+  prefs.begin("loadcell", false);
+  prefs.putFloat("cal_factor", calibration_factor);
+  prefs.putFloat("unit_weight", unit_weight);
+  prefs.putLong("total_count", total_count);
+  prefs.end();
+
+  Serial.println("Ayarlar kaydedildi.");
+}
+
+void loadConfig() {
+  prefs.begin("loadcell", true);
+  calibration_factor = prefs.getFloat("cal_factor", -7050.0);
+  unit_weight = prefs.getFloat("unit_weight", 0.0);
+  total_count = prefs.getLong("total_count", 0);
+  prefs.end();
+
+  Serial.println("Ayarlar yuklendi:");
+  Serial.print("calibration_factor = ");
+  Serial.println(calibration_factor);
+  Serial.print("unit_weight = ");
+  Serial.println(unit_weight);
+  Serial.print("total_count = ");
+  Serial.println(total_count);
+}
+
+void publishStatus(const char* eventName = "status") {
+  StaticJsonDocument<256> doc;
+
+  doc["event"] = eventName;
+  doc["weight"] = current_weight;
+  doc["unit_weight"] = unit_weight;
+  doc["estimated_count"] = estimated_count;
+  doc["total_count"] = total_count;
+  doc["mode"] = current_mode;
+  doc["wifi"] = (WiFi.status() == WL_CONNECTED) ? "connected" : "disconnected";
+  doc["mqtt"] = client.connected() ? "connected" : "disconnected";
+
+  char buffer[256];
+  serializeJson(doc, buffer);
+
+  client.publish(topic_data, buffer);
+  Serial.print("Yayinlandi -> ");
+  Serial.println(buffer);
+}
+
+void doTare() {
+  Serial.println("Tare yapiliyor...");
+  current_mode = "idle";
+
+  scale.set_scale(calibration_factor);
+  delay(300);
+  scale.tare();
+  delay(300);
+
+  current_weight = readStableWeight(20);
+  estimated_count = 0;
+
+  Serial.println("Tare tamamlandi.");
+  publishStatus("tare_done");
+}
+
+void doTeach(int sampleCount) {
+  if (sampleCount <= 0) {
+    Serial.println("Gecersiz sampleCount");
+    publishStatus("teach_failed");
+    return;
+  }
+
+  Serial.print("Teach basladi. Ornek adet: ");
+  Serial.println(sampleCount);
+
+  current_mode = "teach";
+  delay(1000);
+
+  float measuredWeight = readStableWeight(30);
+
+  if (sampleCount > 0) {
+    unit_weight = measuredWeight / sampleCount;
+  }
+
+  Serial.print("Toplam olculen agirlik: ");
+  Serial.println(measuredWeight);
+  Serial.print("Hesaplanan unit_weight: ");
+  Serial.println(unit_weight);
+
+  saveConfig();
+  current_mode = "idle";
+  publishStatus("teach_done");
+}
+
+void setUnitWeight(float value) {
+  unit_weight = value;
+  Serial.print("Yeni unit_weight ayarlandi: ");
+  Serial.println(unit_weight);
+
+  saveConfig();
+  publishStatus("unit_weight_set");
+}
+
+void resetCount() {
+  total_count = 0;
+  estimated_count = 0;
+
+  Serial.println("Toplam sayac sifirlandi.");
+  saveConfig();
+  publishStatus("count_reset");
+}
+
+void handleCommand(char* payload) {
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+
+  if (error) {
+    Serial.print("JSON parse hatasi: ");
+    Serial.println(error.c_str());
+    publishStatus("cmd_parse_error");
+    return;
+  }
+
+  const char* command = doc["command"];
+
+  if (!command) {
+    Serial.println("Komut alani yok.");
+    publishStatus("cmd_missing");
+    return;
+  }
+
+  Serial.print("Gelen komut: ");
+  Serial.println(command);
+
+  if (strcmp(command, "tare") == 0) {
+    doTare();
+  }
+  else if (strcmp(command, "teach") == 0) {
+    int sampleCount = doc["sample_count"] | 1;
+    doTeach(sampleCount);
+  }
+  else if (strcmp(command, "set_unit_weight") == 0) {
+    float value = doc["value"] | 0.0;
+    setUnitWeight(value);
+  }
+  else if (strcmp(command, "reset_count") == 0) {
+    resetCount();
+  }
+  else if (strcmp(command, "ping") == 0) {
+    publishStatus("pong");
+  }
+  else {
+    Serial.println("Bilinmeyen komut.");
+    publishStatus("unknown_command");
+  }
+}
+
+void mqttCallback(char* topic, byte* message, unsigned int length) {
+  Serial.print("Mesaj geldi [");
+  Serial.print(topic);
+  Serial.print("] ");
+
+  char payload[256];
+  if (length >= sizeof(payload)) {
+    length = sizeof(payload) - 1;
+  }
+
+  for (unsigned int i = 0; i < length; i++) {
+    payload[i] = (char)message[i];
+    Serial.print((char)message[i]);
+  }
+  payload[length] = '\0';
+
+  Serial.println();
+
+  handleCommand(payload);
+}
+
+// =========================
+// SETUP
+// =========================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Sistem basliyor...");
+
+  loadConfig();
+
+  scale.begin(HX_DT, HX_SCK);
+
+  if (!scale.is_ready()) {
+    Serial.println("HX711 bulunamadi! Baglantiyi kontrol et.");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  scale.set_scale(calibration_factor);
+
+  setupWiFi();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  doTare();
+}
+
+// =========================
+// LOOP
+// =========================
+void loop() {
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  current_weight = readStableWeight(20);
+
+  // unit_weight tanimliysa tahmini adet hesapla
+  if (unit_weight > 0.001) {
+    estimated_count = round(current_weight / unit_weight);
+    if (estimated_count < 0) {
+      estimated_count = 0;
+    }
+  } else {
+    estimated_count = 0;
+  }
+
+  // Periyodik durum yayini
+  if (millis() - lastPublishTime >= publishInterval) {
+    lastPublishTime = millis();
+    publishStatus("status");
+  }
+
+  delay(100);
+}
