@@ -1,0 +1,69 @@
+#include <HX711.h>
+
+#define HX_DT 23
+#define HX_SCK 22
+
+HX711 scale;
+
+// İlk değer tahmini. Gerekirse büyütüp küçülteceğiz.
+float calibration_factor = -1000.0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("HX711 Kalibrasyon Basliyor...");
+  Serial.println("Loadcell bos olmali.");
+  Serial.println("Birazdan tare yapilacak.");
+
+  scale.begin(HX_DT, HX_SCK);
+
+  if (!scale.is_ready()) {
+    Serial.println("HX711 bulunamadi. Baglantilari kontrol et.");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  scale.set_scale();
+  delay(500);
+  scale.tare();
+
+  Serial.println("Tare tamam.");
+  Serial.println("Simdi loadcell uzerine bilinen bir agirlik koy.");
+  Serial.println("Komutlar:");
+  Serial.println("a -> factor azalt");
+  Serial.println("d -> factor arttir");
+  Serial.println("s -> mevcut factoru yazdir");
+}
+
+void loop() {
+  scale.set_scale(calibration_factor);
+
+  float weight = scale.get_units(20);
+
+  Serial.print("Okunan agirlik: ");
+  Serial.print(weight, 2);
+  Serial.print(" g");
+  Serial.print(" | calibration_factor: ");
+  Serial.println(calibration_factor, 2);
+
+  if (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == 'a') {
+      calibration_factor -= 10.0;
+    }
+    else if (c == 'd') {
+      calibration_factor += 10.0;
+    }
+    else if (c == 's') {
+      Serial.println("------");
+      Serial.print("Mevcut calibration_factor = ");
+      Serial.println(calibration_factor, 6);
+      Serial.println("------");
+    }
+  }
+
+  delay(500);
+}
